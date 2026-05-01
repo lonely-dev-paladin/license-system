@@ -17,10 +17,10 @@ import bcrypt
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    raise Exception("JWT_SECRET is missing")
+    raise RuntimeError("JWT_SECRET is missing")
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://licenseui.onrender.com"])
 
 # =========================
 # RBAC
@@ -59,7 +59,7 @@ RATE_WINDOW = 10
 RATE_MAX = 20
 
 def rate_limiter():
-    ip = request.remote_addr
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     now = time.time()
 
     requests = RATE_LIMIT.get(ip, [])
@@ -118,7 +118,13 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    conn = db()
+    if not username or not password:
+        return jsonify({"error": "missing credentials"}), 400
+
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("SELECT * FROM admins WHERE username=%s", (username,))
@@ -129,7 +135,7 @@ def login():
     if not admin:
         return jsonify({"error": "invalid credentials"}), 401
 
-    # 🔐 bcrypt check (IMPORTANT)
+    #bcrypt check (IMPORTANT)
     if not bcrypt.checkpw(password.encode(), admin["password_hash"].encode()):
         return jsonify({"error": "invalid credentials"}), 401
 
@@ -168,7 +174,10 @@ def add_license():
     if days <= 0:
         return json_error("days must be greater than 0")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("SELECT 1 FROM users WHERE license_key=%s", (license_key,))
@@ -208,7 +217,10 @@ def validate():
     if not license_key or not device_id:
         return json_error("license_key and device_id required")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -269,13 +281,16 @@ def validate():
 @token_required
 @roles_required("admin", "moderator")
 def ban():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     key = data.get("license_key")
 
     if not key:
         return json_error("license_key required")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     # check first
@@ -313,13 +328,16 @@ def ban():
 @token_required
 @roles_required("admin", "moderator")
 def unban():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     key = data.get("license_key")
 
     if not key:
         return json_error("license_key required")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -355,7 +373,7 @@ def unban():
 @token_required
 @roles_required("admin", "moderator")
 def extend():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
     key = data.get("license_key")
 
@@ -367,10 +385,13 @@ def extend():
     if days <= 0:
         return json_error("days must not be 0 or negative")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    # ✅ get current user FIRST
+    #get current user FIRST
     c.execute("""
         SELECT expires, banned 
         FROM users
@@ -410,13 +431,16 @@ def extend():
 @token_required
 @roles_required("admin", "moderator")
 def delete():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     key = data.get("license_key")
 
     if not key:
         return json_error("license_key required")
 
-    conn = db()
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor()
 
     c.execute("""
@@ -439,7 +463,11 @@ def delete():
 @token_required
 @roles_required("admin", "moderator")
 def stats():
-    conn = db()
+
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -476,7 +504,11 @@ def stats():
 @token_required
 @roles_required("admin", "moderator")
 def users():
-    conn = db()
+
+    try:
+        conn = db()
+    except Exception:
+        return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -514,5 +546,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
-
-    #jshgfyusrf
