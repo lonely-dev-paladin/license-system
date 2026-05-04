@@ -14,7 +14,7 @@ import bcrypt
 from psycopg2 import OperationalError
 
 #use to create hash password when adding new admin
-#print(bcrypt.hashpw("my password here".encode(), bcrypt.gensalt()).decode())
+#print(bcrypt.hashpw("Test23".encode(), bcrypt.gensalt()).decode())
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
@@ -90,14 +90,28 @@ def token_required(f):
         if not auth:
             return jsonify({"error": "missing token"}), 403
 
-        #safer parsing
         token = auth.replace("Bearer ", "").strip()
 
         try:
             decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+
+            admin_id = decoded["admin_id"]
+
+            #check if admin still exists
+            conn = db()
+            c = conn.cursor()
+
+            c.execute("SELECT id FROM admins WHERE id=%s", (admin_id,))
+            admin = c.fetchone()
+
+            conn.close()
+
+            if not admin:
+                return jsonify({"error": "admin no longer exists"}), 403
+
             g.user = decoded["user"]
             g.role = decoded["role"]
-            g.admin_id = decoded["admin_id"]
+            g.admin_id = admin_id
 
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "token expired"}), 403
