@@ -21,8 +21,7 @@ if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-#CORS(app, origins=["https://licenseui.onrender.com"])
-CORS(app)
+CORS(app, origins=["https://licenseui.onrender.com"])
 
 # =========================
 # RBAC
