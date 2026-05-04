@@ -13,15 +13,15 @@ import jwt
 import bcrypt
 from psycopg2 import OperationalError
 
-#use to create hash password
-#print(bcrypt.hashpw("Axion23".encode(), bcrypt.gensalt()).decode())
+#use to create hash password when adding new admin
+#print(bcrypt.hashpw("my password here".encode(), bcrypt.gensalt()).decode())
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-CORS(app, origins=["https://licenseui.onrender.com"])
+CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
 
 # =========================
 # RBAC
@@ -31,7 +31,7 @@ def roles_required(*roles):
         @wraps(f)
         def wrapper(*args, **kwargs):
 
-            # FIX: prevent crash if role missing
+            #prevent crash if role missing
             if not hasattr(g, "role"):
                 return jsonify({"error": "unauthorized"}), 403
 
@@ -44,7 +44,7 @@ def roles_required(*roles):
     return decorator
 
 # =========================
-# DB
+# DB (DataBase)
 # =========================
 def db():
     url = os.getenv("DATABASE_URL")
@@ -74,13 +74,13 @@ def rate_limiter():
     return True
 
 # =========================
-# HELPERS
+# HELPERS - might add helpers soon to decrease line of codes :)
 # =========================
 def json_error(msg, code=400):
     return jsonify({"error": msg}), code
 
 # =========================
-# JWT MIDDLEWARE
+# JWT MIDDLEWARE - backend protection
 # =========================
 def token_required(f):
     @wraps(f)
@@ -90,7 +90,7 @@ def token_required(f):
         if not auth:
             return jsonify({"error": "missing token"}), 403
 
-        # FIX: safer parsing
+        #safer parsing
         token = auth.replace("Bearer ", "").strip()
 
         try:
@@ -121,8 +121,6 @@ def login():
 
     if not username or not password:
         return jsonify({"error": "missing credentials"}), 400
-
-    # DB connection (safer exception handling)
     try:
         conn = db()
     except OperationalError:
@@ -174,8 +172,6 @@ def add_license():
     license_key = data.get("license_key")
     if not license_key:
         return json_error("license key required")
-
-    # ONLY catch number conversion errors
     try:
         days = int(data.get("days", 7))
     except (TypeError, ValueError):
@@ -184,10 +180,10 @@ def add_license():
     if days <= 0:
         return json_error("days must be greater than 0")
 
-    # ONLY DB connection errors (better than Exception)
+
     try:
         conn = db()
-    except psycopg2.OperationalError:
+    except psycopg2.OperationalError: #catch error coming from db only
         return jsonify({"error": "database connection failed"}), 500
 
     c = conn.cursor(cursor_factory=RealDictCursor)
@@ -195,7 +191,7 @@ def add_license():
     c.execute("SELECT 1 FROM users WHERE license_key=%s", (license_key,))
     if c.fetchone():
         conn.close()
-        return json_error("duplicate key")
+        return json_error("key already exist")
 
     expires = datetime.now(timezone.utc) + timedelta(days=days)
 
@@ -214,7 +210,7 @@ def add_license():
     })
 
 # =========================
-# VALIDATE (PUBLIC)
+# VALIDATE - this where apps connect to validate their keys, ex. expiry, banned, etc.
 # =========================
 @app.route("/validate", methods=["POST"])
 def validate():
@@ -227,7 +223,7 @@ def validate():
     device_id = data.get("device_id")
 
     if not license_key or not device_id:
-        return json_error("license_key and device_id required")
+        return json_error("license and device id required")
 
     try:
         conn = db()
@@ -246,7 +242,7 @@ def validate():
 
     if not user:
         conn.close()
-        return jsonify({"status": "invalid_key"})
+        return jsonify({"status": "invalid key"})
 
     now = datetime.now(timezone.utc)
 
@@ -277,7 +273,7 @@ def validate():
 
     if user["bound_device"] != device_id:
         conn.close()
-        return jsonify({"status": "device_mismatch"})
+        return jsonify({"status": "device mismatch"})
 
     conn.close()
     return jsonify({
