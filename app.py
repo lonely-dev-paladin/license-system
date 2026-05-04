@@ -11,16 +11,18 @@ import os
 import time
 import jwt
 import bcrypt
+from psycopg2 import OperationalError
 
 #use to create hash password
-#print(bcrypt.hashpw("136741090603".encode(), bcrypt.gensalt()).decode())
+#print(bcrypt.hashpw("Axion23".encode(), bcrypt.gensalt()).decode())
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    raise RuntimeError("JWT_SECRET is missing")
+    raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-CORS(app, origins=["https://licenseui.onrender.com"])
+#CORS(app, origins=["https://licenseui.onrender.com"])
+CORS(app)
 
 # =========================
 # RBAC
@@ -48,7 +50,7 @@ def roles_required(*roles):
 def db():
     url = os.getenv("DATABASE_URL")
     if not url:
-        raise Exception("DATABASE_URL is missing")
+        raise Exception("DATABASE URL is missing")
     return psycopg2.connect(url, sslmode="require")
 
 # =========================
@@ -121,22 +123,30 @@ def login():
     if not username or not password:
         return jsonify({"error": "missing credentials"}), 400
 
+    # DB connection (safer exception handling)
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    c.execute("SELECT * FROM admins WHERE username=%s", (username,))
-    admin = c.fetchone()
+    c.execute(
+        "SELECT * FROM admins WHERE username=%s",
+        (username,)
+    )
 
+    admin = c.fetchone()
     conn.close()
 
     if not admin:
         return jsonify({"error": "invalid credentials"}), 401
 
-    #bcrypt check (IMPORTANT)
-    if not bcrypt.checkpw(password.encode(), admin["password_hash"].encode()):
+    # bcrypt check
+    if not bcrypt.checkpw(
+        password.encode(),
+        admin["password_hash"].encode()
+    ):
         return jsonify({"error": "invalid credentials"}), 401
 
     payload = {
@@ -164,20 +174,23 @@ def add_license():
 
     license_key = data.get("license_key")
     if not license_key:
-        return json_error("license_key required")
+        return json_error("license key required")
 
+    # ONLY catch number conversion errors
     try:
         days = int(data.get("days", 7))
-    except:
+    except (TypeError, ValueError):
         return json_error("invalid days")
 
     if days <= 0:
         return json_error("days must be greater than 0")
 
+    # ONLY DB connection errors (better than Exception)
     try:
         conn = db()
-    except Exception:
+    except psycopg2.OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("SELECT 1 FROM users WHERE license_key=%s", (license_key,))
@@ -219,8 +232,9 @@ def validate():
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -285,12 +299,13 @@ def ban():
     key = data.get("license_key")
 
     if not key:
-        return json_error("license_key required")
+        return json_error("license key required")
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     # check first
@@ -332,12 +347,13 @@ def unban():
     key = data.get("license_key")
 
     if not key:
-        return json_error("license_key required")
+        return json_error("license key required")
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
     c.execute("""
@@ -376,22 +392,25 @@ def extend():
     data = request.get_json(silent=True) or {}
 
     key = data.get("license_key")
+    if not key:
+        return json_error("license key required")
 
+    # FIX: only catch real input errors
     try:
         days = int(data.get("days", 1))
-    except:
+    except (ValueError, TypeError):
         return json_error("invalid days")
 
     if days <= 0:
-        return json_error("days must not be 0 or negative")
+        return json_error("days must be greater than 0")
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    #get current user FIRST
     c.execute("""
         SELECT expires, banned 
         FROM users
@@ -402,7 +421,7 @@ def extend():
 
     if not row:
         conn.close()
-        return json_error("not found or not yours")
+        return json_error("invalid key")
 
     if row["banned"]:
         conn.close()
@@ -435,11 +454,11 @@ def delete():
     key = data.get("license_key")
 
     if not key:
-        return json_error("license_key required")
+        return json_error("license key required")
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor()
 
@@ -466,7 +485,7 @@ def stats():
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
     c = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -474,15 +493,15 @@ def stats():
         SELECT * FROM users
         WHERE admin_id = %s
     """, (g.admin_id,))
-    users = c.fetchall()
+    records = c.fetchall()
     conn.close()
 
     now = datetime.now(timezone.utc)
 
-    total = len(users)
+    total = len(records)
     active = banned = expired = 0
 
-    for u in users:
+    for u in records:
         if u["banned"]:
             banned += 1
         elif now > u["expires"]:
@@ -507,29 +526,58 @@ def users():
 
     try:
         conn = db()
-    except Exception:
+    except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
+
     c = conn.cursor(cursor_factory=RealDictCursor)
+
+    c.execute("""
+        UPDATE users
+        SET state = CASE
+            WHEN expires < NOW() THEN 'expired'
+            ELSE 'active'
+        END
+        WHERE admin_id = %s
+    """, (g.admin_id,))
+    conn.commit()
 
     c.execute("""
         SELECT * FROM users
         WHERE admin_id = %s
     """, (g.admin_id,))
+
     rows = c.fetchall()
     conn.close()
 
     now = datetime.now(timezone.utc)
 
     result = []
+
     for u in rows:
-        days_left = max(int((u["expires"] - now).total_seconds() / 86400), 0)
+
+        remaining_seconds = int((u["expires"] - now).total_seconds())
+
+        if remaining_seconds <= 0:
+            time_left = "expired"
+        else:
+            days = remaining_seconds // 86400
+            hours = (remaining_seconds % 86400) // 3600
+            minutes = (remaining_seconds % 3600) // 60
+
+            if days > 0:
+                time_left = f"{days}d {hours}h"
+            elif hours > 0:
+                time_left = f"{hours}h {minutes}m"
+            else:
+                time_left = f"{minutes}m"
 
         result.append({
             "license_key": u["license_key"],
-            "bound_device": u["bound_device"] or "NOT_BOUND",
+            "bound_device": u["bound_device"] or "not bound",
             "status": u["status"],
             "banned": u["banned"],
-            "days_left": days_left,
+            "state": u["state"],
+            "time_left": time_left,
             "expires": u["expires"].isoformat()
         })
 
@@ -538,7 +586,6 @@ def users():
 # =========================
 # RUN
 # =========================
-import os
 
 if __name__ == "__main__":
     app.run(
