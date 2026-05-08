@@ -13,16 +13,13 @@ import jwt
 import bcrypt
 from psycopg2 import OperationalError
 
-#use to create hash password when adding new admin
-#print(bcrypt.hashpw("Test23".encode(), bcrypt.gensalt()).decode())
-
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-#CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
-CORS(app)
+CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
+#CORS(app)
 
 # =========================
 # RBAC
