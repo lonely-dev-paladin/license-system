@@ -22,6 +22,7 @@ if not SECRET_KEY:
 
 app = Flask(__name__)
 CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
+#CORS(app)
 
 # =========================
 # RBAC
@@ -591,6 +592,17 @@ def users():
         })
 
     return jsonify({"users": result})
+
+# =========================
+# ADMIN CONTEXT
+# ========================
+@app.route("/me", methods=["GET"])
+@token_required
+def me():
+    return jsonify({
+        "user": g.user,
+        "role": g.role
+    })
 
 # =========================
 # RUN
