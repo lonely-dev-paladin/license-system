@@ -21,8 +21,8 @@ if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
-#CORS(app)
+#CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
+CORS(app)
 
 # =========================
 # RBAC
@@ -180,7 +180,7 @@ def login():
 # =========================
 @app.route("/add", methods=["POST"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def add_license():
     data = request.get_json(silent=True) or {}
 
@@ -303,7 +303,7 @@ def validate():
 # =========================
 @app.route("/ban", methods=["POST"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def ban():
     data = request.get_json(silent=True) or {}
     key = data.get("license_key")
@@ -351,7 +351,7 @@ def ban():
 # =========================
 @app.route("/unban", methods=["POST"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def unban():
     data = request.get_json(silent=True) or {}
     key = data.get("license_key")
@@ -397,7 +397,7 @@ def unban():
 # =========================
 @app.route("/extend", methods=["POST"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def extend():
     data = request.get_json(silent=True) or {}
 
@@ -458,7 +458,7 @@ def extend():
 # =========================
 @app.route("/delete", methods=["POST"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def delete():
     data = request.get_json(silent=True) or {}
     key = data.get("license_key")
@@ -490,7 +490,7 @@ def delete():
 # =========================
 @app.route("/stats", methods=["GET"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def stats():
 
     try:
@@ -531,7 +531,7 @@ def stats():
 # =========================
 @app.route("/users", methods=["GET"])
 @token_required
-@roles_required("admin", "moderator")
+@roles_required("admin", "moderator", "superadmin")
 def users():
 
     try:
@@ -595,7 +595,7 @@ def users():
 
 # =========================
 # ADMIN CONTEXT
-# ========================
+# =========================
 @app.route("/me", methods=["GET"])
 @token_required
 def me():
@@ -603,6 +603,62 @@ def me():
         "user": g.user,
         "role": g.role
     })
+
+# ==========================
+# SUPER ADMIN: CREATE ADMIN
+# ==========================
+@app.route("/create-admin", methods=["POST"])
+@token_required
+@roles_required("superadmin")
+def create_admin():
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    password = data.get("password")
+    role = data.get("role", "admin")
+
+    # ==========================
+    # VALIDATION
+    # ==========================
+    if not username or not password:
+        return jsonify({"error": "missing fields"}), 400
+
+    try:
+        conn = db()
+        c = conn.cursor(cursor_factory=RealDictCursor)
+
+        # ==========================
+        # CHECK DUPLICATE USERNAME
+        # ==========================
+        c.execute("SELECT id FROM admins WHERE username=%s", (username,))
+        if c.fetchone():
+            conn.close()
+            return jsonify({"error": "username already exists"}), 409
+
+        # ==========================
+        # HASH PASSWORD
+        # ==========================
+        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+        # ==========================
+        # INSERT ADMIN
+        # ==========================
+        c.execute("""
+            INSERT INTO admins (username, password_hash, role, created_at)
+            VALUES (%s, %s, %s, NOW())
+        """, (username, hashed, role))
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"message": "admin created"}), 201
+
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    except Exception as e:
+        print("CREATE ADMIN ERROR:", e)
+        return jsonify({"error": "internal server error"}), 500
 
 # =========================
 # RUN
