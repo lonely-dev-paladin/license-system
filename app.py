@@ -126,6 +126,10 @@ def token_required(f):
 # =========================
 @app.route("/login", methods=["POST"])
 def login():
+
+    if not rate_limiter():
+        return jsonify({"error": "too many requests!"}), 429
+
     data = request.get_json(silent=True) or {}
 
     username = data.get("username")
