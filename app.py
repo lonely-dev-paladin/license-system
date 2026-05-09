@@ -54,21 +54,60 @@ def db():
 # RATE LIMIT
 # =========================
 RATE_LIMIT = {}
-RATE_WINDOW = 10
-RATE_MAX = 20
 
-def rate_limiter():
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+# global settings
+RATE_WINDOW = 60      # 1minute window (better than 10s for login)
+RATE_MAX_IP = 30      # per IP limit
+RATE_MAX_USER = 5     # per username limit (VERY important)
+
+
+def get_client_ip():
+    ip = request.headers.get("X-Forwarded-For")
+
+    if ip:
+        ip = ip.split(",")[0].strip()
+    else:
+        ip = request.remote_addr
+
+    return ip or "unknown"
+
+
+def rate_limiter(username=None):
+    ip = get_client_ip()
     now = time.time()
 
-    requests = RATE_LIMIT.get(ip, [])
-    requests = [t for t in requests if now - t < RATE_WINDOW]
+    # -----------------------------
+    # create separate keys
+    # -----------------------------
+    ip_key = f"ip:{ip}"
+    user_key = f"user:{username}" if username else None
 
-    if len(requests) >= RATE_MAX:
+    def check_limit(key, limit):
+        history = list(RATE_LIMIT.get(key) or [])
+
+        # keep only recent requests
+        history = [t for t in history if now - t < RATE_WINDOW]
+
+        if len(history) >= limit:
+            return False
+
+        history.append(now)
+        RATE_LIMIT[key] = history
+        return True
+
+    # -----------------------------
+    # IP check (basic protection)
+    # -----------------------------
+    if not check_limit(ip_key, RATE_MAX_IP):
         return False
 
-    requests.append(now)
-    RATE_LIMIT[ip] = requests
+    # -----------------------------
+    # username check (VERY IMPORTANT for brute force)
+    # -----------------------------
+    if user_key:
+        if not check_limit(user_key, RATE_MAX_USER):
+            return False
+
     return True
 
 # =========================
