@@ -18,8 +18,8 @@ if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
-CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
-#CORS(app)
+#CORS(app, origins=["https://licenseui.onrender.com"]) #talks to frontend
+CORS(app)
 
 # =========================
 # RBAC
@@ -699,6 +699,21 @@ def create_admin():
     except Exception as e:
         print("CREATE ADMIN ERROR:", e)
         return jsonify({"error": "internal server error"}), 500
+
+
+# =========================
+# keep database alive
+# =========================
+@app.route("/ping", methods=["GET"])
+def ping():
+    try:
+        conn = db()
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        conn.close()
+        return jsonify({"status": "awake"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # =========================
 # RUN
