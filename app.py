@@ -399,7 +399,7 @@ def reset_device():
         WHERE license_key=%s AND admin_id=%s
     """, (key, g.admin_id))
 
-    log_audit(conn, g.admin_id, "reset_device", key, f"unbound to ={row['bound_device']}")
+    log_audit(conn, g.admin_id, "reset_device", key, f"unbound to = {row['bound_device']}")
 
     conn.commit()
     conn.close()
