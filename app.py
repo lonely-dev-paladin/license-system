@@ -122,6 +122,7 @@ def json_error(msg, code=400):
 _DUMMY_HASH = bcrypt.hashpw(b"dummy-password-for-timing", bcrypt.gensalt()).decode()
 
 MAX_LICENSE_DAYS = 3650  # 10 years, sanity cap
+MAX_DEVICES_CAP = 1000   # sanity cap on devices-per-key
 
 
 def valid_license_key(key: str) -> bool:
@@ -248,6 +249,14 @@ def add_license():
         return json_error(f"days must be between 1 and {MAX_LICENSE_DAYS}")
 
     try:
+        max_devices = int(data.get("max_devices", 1))
+    except (TypeError, ValueError):
+        return json_error("invalid max_devices")
+
+    if max_devices <= 0 or max_devices > MAX_DEVICES_CAP:
+        return json_error(f"max_devices must be between 1 and {MAX_DEVICES_CAP}")
+
+    try:
         conn = db()
     except OperationalError:
         return jsonify({"error": "database connection failed"}), 500
@@ -259,14 +268,15 @@ def add_license():
         conn.close()
         return json_error("key already exist")
 
-    expires = datetime.now(timezone.utc) + timedelta(days=days)
-
+    # NOTE: expires and activated_at stay NULL here on purpose — the key's
+    # countdown doesn't start until the first device binds to it via /validate.
     c.execute("""
-        INSERT INTO users (license_key, status, expires, banned, bound_device, admin_id)
+        INSERT INTO users (license_key, status, banned, admin_id, max_devices, duration_days)
         VALUES (%s, %s, %s, %s, %s, %s)
-    """, (license_key, "premium", expires, False, None, g.admin_id))
+    """, (license_key, "premium", False, g.admin_id, max_devices, days))
 
-    log_audit(conn, g.admin_id, "create_license", license_key, f"days={days}")
+    log_audit(conn, g.admin_id, "create_license", license_key,
+               f"duration_days={days}, max_devices={max_devices}")
 
     conn.commit()
     conn.close()
@@ -274,7 +284,8 @@ def add_license():
     return jsonify({
         "message": "license created",
         "license_key": license_key,
-        "expires": expires.isoformat()
+        "duration_days": days,
+        "max_devices": max_devices
     })
 
 # =========================
@@ -299,7 +310,7 @@ def validate():
 
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("""
-        SELECT license_key, status, expires, banned, bound_device
+        SELECT license_key, status, expires, banned, max_devices, duration_days, activated_at
         FROM users
         WHERE license_key=%s
     """, (license_key,))
@@ -309,55 +320,73 @@ def validate():
         conn.close()
         return jsonify({"status": "invalid key"})
 
-    now = datetime.now(timezone.utc)
-
     if user["banned"]:
         conn.close()
         return jsonify({"status": "banned"})
+
+    now = datetime.now(timezone.utc)
+
+    # ---- Activation: the countdown starts on first bind, not at creation ----
+    if user["activated_at"] is None:
+        new_expires = now + timedelta(days=user["duration_days"])
+
+        # Atomic claim: only succeeds if still un-activated at write time,
+        # so two concurrent "first binds" can't both start the clock.
+        c.execute("""
+            UPDATE users
+            SET activated_at=%s, expires=%s
+            WHERE license_key=%s AND activated_at IS NULL
+            RETURNING expires
+        """, (now, new_expires, license_key))
+        claimed = c.fetchone()
+        conn.commit()
+
+        if claimed:
+            user["expires"] = claimed["expires"]
+        else:
+            # Someone else activated it in the tiny window between SELECT and UPDATE.
+            c.execute("SELECT expires FROM users WHERE license_key=%s", (license_key,))
+            user["expires"] = c.fetchone()["expires"]
 
     if now > user["expires"]:
         conn.close()
         return jsonify({"status": "expired"})
 
-    if not user["bound_device"]:
-        # Atomic claim: only succeeds if bound_device is still NULL at write time,
-        # so two concurrent requests can't both bind different devices.
+    # ---- Device binding ----
+    c.execute("""
+        SELECT 1 FROM license_devices WHERE license_key=%s AND device_id=%s
+    """, (license_key, device_id))
+    already_bound = c.fetchone()
+
+    if not already_bound:
+        # Atomic claim: only inserts if the device count is still under the
+        # cap at write time, so concurrent activations can't overshoot max_devices.
         c.execute("""
-            UPDATE users
-            SET bound_device=%s
-            WHERE license_key=%s AND bound_device IS NULL
-            RETURNING bound_device
-        """, (device_id, license_key))
-        claimed = c.fetchone()
+            INSERT INTO license_devices (license_key, device_id, bound_at)
+            SELECT %s, %s, NOW()
+            WHERE (SELECT COUNT(*) FROM license_devices WHERE license_key=%s) < %s
+            ON CONFLICT (license_key, device_id) DO NOTHING
+            RETURNING id
+        """, (license_key, device_id, license_key, user["max_devices"]))
+        inserted = c.fetchone()
         conn.commit()
 
-        if claimed:
-            conn.close()
-            return jsonify({
-                "status": "active",
-                "license_key": license_key,
-                "expires": user["expires"].isoformat(),
-                "bound_device": device_id
-            })
-
-        # Someone else claimed it in the tiny window between our SELECT and UPDATE.
-        c.execute("SELECT bound_device FROM users WHERE license_key=%s", (license_key,))
-        user = c.fetchone()
-        conn.close()
-        if user["bound_device"] != device_id:
-            return jsonify({"status": "device mismatch"})
-        return jsonify({"status": "active", "license_key": license_key, "bound_device": device_id})
-
-    if user["bound_device"] != device_id:
-        conn.close()
-        return jsonify({"status": "device mismatch"})
+        if not inserted:
+            # Either the cap was already reached, or a concurrent request
+            # bound this exact device first — tell them apart.
+            c.execute("""
+                SELECT 1 FROM license_devices WHERE license_key=%s AND device_id=%s
+            """, (license_key, device_id))
+            if not c.fetchone():
+                conn.close()
+                return jsonify({"status": "device limit reached"})
 
     conn.close()
     return jsonify({
         "status": "active",
         "license_key": license_key,
         "expires": user["expires"].isoformat(),
-        "bound_device": user["bound_device"]
+        "device_id": device_id
     })
 
 # =========================
@@ -367,9 +396,12 @@ def validate():
 @token_required
 @roles_required("admin", "moderator", "superadmin")
 def reset_device():
-    """Unbind a license from its device so it can be activated on a new machine."""
+    """Unbinds device(s) from a license so it can be activated elsewhere.
+    Pass 'device_id' to unbind just that one device; omit it to clear all
+    devices bound to the key."""
     data = request.get_json(silent=True) or {}
     key = data.get("license_key")
+    device_id = data.get("device_id")  # optional
 
     if not key:
         return json_error("license key required")
@@ -380,31 +412,35 @@ def reset_device():
         return jsonify({"error": "database connection failed"}), 500
 
     c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("""
-        SELECT bound_device FROM users
-        WHERE license_key=%s AND admin_id=%s
-    """, (key, g.admin_id))
-    row = c.fetchone()
 
-    if not row:
+    # ownership check — this key must belong to the calling admin
+    c.execute("SELECT 1 FROM users WHERE license_key=%s AND admin_id=%s", (key, g.admin_id))
+    if not c.fetchone():
         conn.close()
         return json_error("not found")
 
-    if not row["bound_device"]:
+    if device_id:
+        c.execute("""
+            DELETE FROM license_devices
+            WHERE license_key=%s AND device_id=%s
+        """, (key, device_id))
+        removed = c.rowcount
+        detail = f"device_id={device_id}"
+    else:
+        c.execute("DELETE FROM license_devices WHERE license_key=%s", (key,))
+        removed = c.rowcount
+        detail = "all devices"
+
+    if removed == 0:
         conn.close()
-        return json_error("license is not bound to any device")
+        return json_error("no matching device bound to this license")
 
-    c.execute("""
-        UPDATE users SET bound_device=NULL
-        WHERE license_key=%s AND admin_id=%s
-    """, (key, g.admin_id))
-
-    log_audit(conn, g.admin_id, "reset_device", key, f"was_bound_to={row['bound_device']}")
+    log_audit(conn, g.admin_id, "reset_device", key, detail)
 
     conn.commit()
     conn.close()
 
-    return jsonify({"message": "device reset successfully"})
+    return jsonify({"message": "device reset successfully", "removed": removed})
 
 # =========================
 # BAN
@@ -524,7 +560,7 @@ def extend():
 
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("""
-        SELECT expires, banned
+        SELECT expires, banned, activated_at, duration_days
         FROM users
         WHERE license_key=%s AND admin_id=%s
     """, (key, g.admin_id))
@@ -537,6 +573,26 @@ def extend():
     if row["banned"]:
         conn.close()
         return json_error("cannot extend banned account")
+
+    if row["activated_at"] is None:
+        # Key hasn't started its period yet — there's no expiry to push out,
+        # so extend the length of the period it'll get once it does activate.
+        new_duration = row["duration_days"] + days
+        c.execute("""
+            UPDATE users SET duration_days=%s
+            WHERE license_key=%s AND admin_id=%s
+        """, (new_duration, key, g.admin_id))
+
+        log_audit(conn, g.admin_id, "extend", key,
+                   f"days={days} (not yet activated, new duration_days={new_duration})")
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "message": "extended (not yet activated — added to its future duration)",
+            "new_duration_days": new_duration
+        })
 
     new_exp = row["expires"] + timedelta(days=days)
 
@@ -606,17 +662,25 @@ def stats():
 
     now = datetime.now(timezone.utc)
     total = len(records)
-    active = banned = expired = 0
+    active = banned = expired = pending = 0
 
     for u in records:
         if u["banned"]:
             banned += 1
+        elif u["expires"] is None:
+            pending += 1
         elif now > u["expires"]:
             expired += 1
         else:
             active += 1
 
-    return jsonify({"total": total, "active": active, "banned": banned, "expired": expired})
+    return jsonify({
+        "total": total,
+        "active": active,
+        "banned": banned,
+        "expired": expired,
+        "pending": pending
+    })
 
 # =========================
 # USERS
@@ -632,20 +696,23 @@ def users():
 
     c = conn.cursor(cursor_factory=RealDictCursor)
 
-    # NOTE: this mutates state on what's otherwise a read (GET) request.
-    # Works fine today; if this grows, move the expiry sweep to a scheduled
-    # job instead of running it on every dashboard load.
+    # State is now computed in Python below instead of stored/updated via SQL —
+    # a stored 'expired' column can't safely represent a NULL (not-yet-activated)
+    # expires date, so we compute active/expired/pending/banned fresh each time.
     c.execute("""
-        UPDATE users
-        SET state = CASE
-            WHEN expires < NOW() THEN 'expired'
-            ELSE 'active'
-        END
-        WHERE admin_id = %s
+        SELECT u.license_key, u.status, u.banned, u.expires, u.max_devices,
+               u.duration_days, u.activated_at,
+               COALESCE(d.device_count, 0) AS device_count,
+               COALESCE(d.device_list, ARRAY[]::text[]) AS device_list
+        FROM users u
+        LEFT JOIN (
+            SELECT license_key, COUNT(*) AS device_count, array_agg(device_id) AS device_list
+            FROM license_devices
+            GROUP BY license_key
+        ) d ON d.license_key = u.license_key
+        WHERE u.admin_id = %s
     """, (g.admin_id,))
-    conn.commit()
 
-    c.execute("SELECT * FROM users WHERE admin_id = %s", (g.admin_id,))
     rows = c.fetchall()
     conn.close()
 
@@ -653,30 +720,43 @@ def users():
     result = []
 
     for u in rows:
-        remaining_seconds = int((u["expires"] - now).total_seconds())
-
-        if remaining_seconds <= 0:
-            time_left = "expired"
+        if u["banned"]:
+            state = "banned"
+        elif u["expires"] is None:
+            state = "pending"
+        elif now > u["expires"]:
+            state = "expired"
         else:
-            days = remaining_seconds // 86400
-            hours = (remaining_seconds % 86400) // 3600
-            minutes = (remaining_seconds % 3600) // 60
+            state = "active"
 
-            if days > 0:
-                time_left = f"{days}d {hours}h"
-            elif hours > 0:
-                time_left = f"{hours}h {minutes}m"
+        if u["expires"] is None:
+            time_left = f"not started (period: {u['duration_days']}d)"
+        else:
+            remaining_seconds = int((u["expires"] - now).total_seconds())
+            if remaining_seconds <= 0:
+                time_left = "expired"
             else:
-                time_left = f"{minutes}m"
+                days = remaining_seconds // 86400
+                hours = (remaining_seconds % 86400) // 3600
+                minutes = (remaining_seconds % 3600) // 60
+
+                if days > 0:
+                    time_left = f"{days}d {hours}h"
+                elif hours > 0:
+                    time_left = f"{hours}h {minutes}m"
+                else:
+                    time_left = f"{minutes}m"
 
         result.append({
             "license_key": u["license_key"],
-            "bound_device": u["bound_device"] or "not bound",
             "status": u["status"],
             "banned": u["banned"],
-            "state": u["state"],
+            "state": state,
             "time_left": time_left,
-            "expires": u["expires"].isoformat()
+            "expires": u["expires"].isoformat() if u["expires"] else None,
+            "max_devices": u["max_devices"],
+            "device_count": u["device_count"],
+            "devices": u["device_list"],
         })
 
     return jsonify({"users": result})
