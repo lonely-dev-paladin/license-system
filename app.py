@@ -399,7 +399,7 @@ def reset_device():
         WHERE license_key=%s AND admin_id=%s
     """, (key, g.admin_id))
 
-    log_audit(conn, g.admin_id, "reset_device", key, f"unbound to = {row['bound_device']}")
+    log_audit(conn, g.admin_id, "reset_device", key, f"was_bound_to={row['bound_device']}")
 
     conn.commit()
     conn.close()
@@ -721,6 +721,24 @@ def audit_log():
             for r in rows
         ]
     })
+
+@app.route("/audit-log", methods=["DELETE"])
+@token_required
+@roles_required("admin", "moderator", "superadmin")
+def clear_audit_log():
+    """Clears only the calling admin's own audit history, not other admins'."""
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor()
+    c.execute("DELETE FROM audit_log WHERE admin_id = %s", (g.admin_id,))
+    deleted_count = c.rowcount
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "audit log cleared", "deleted": deleted_count})
 
 # =========================
 # ADMIN CONTEXT
