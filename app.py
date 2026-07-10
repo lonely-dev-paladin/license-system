@@ -12,8 +12,18 @@ import os
 import time
 import jwt
 import bcrypt
-import redis
+import secrets
+import base64
 from psycopg2 import OperationalError
+
+# redis is optional — only needed if you set REDIS_URL for shared rate
+# limiting across multiple worker processes. Without it (or without the
+# package installed), rate limiting just falls back to in-memory, per-process
+# counting, same as before Redis support was added.
+try:
+    import redis
+except ImportError:
+    redis = None
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
@@ -31,8 +41,10 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
 # Defense-in-depth against oversized request bodies (memory-exhaustion DoS).
-# Nothing this API does legitimately needs more than a few KB per request.
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024  # 16 KB
+# Raised from a stricter 16 KB to accommodate base64-encoded proof-of-payment
+# screenshots on /admin-requests — every other endpoint still enforces its
+# own tight per-field length limits regardless of this outer ceiling.
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB
 
 CORS(app, origins=["https://licenseui.onrender.com"])  # talks to frontend
 
@@ -71,7 +83,8 @@ def db():
 REDIS_URL = os.getenv("REDIS_URL")
 _redis_client = None
 
-if REDIS_URL:
+if REDIS_URL and redis is not None:
+    assert redis is not None  # narrows the type for static analysis below
     try:
         _redis_client = redis.from_url(
             REDIS_URL,
@@ -81,9 +94,15 @@ if REDIS_URL:
         )
         _redis_client.ping()
         print("Rate limiting: connected to Redis")
-    except Exception as e:
-        print("Rate limiting: Redis unreachable at startup, using in-memory fallback:", e)
+    # noinspection PyBroadException
+    except Exception as redis_startup_err:
+        # Intentionally broad: ANY failure here (bad URL, auth, network,
+        # timeout...) should fall back to in-memory limiting rather than
+        # crash the whole app at import time.
+        print("Rate limiting: Redis unreachable at startup, using in-memory fallback:", redis_startup_err)
         _redis_client = None
+elif REDIS_URL and redis is None:
+    print("Rate limiting: REDIS_URL is set but the 'redis' package isn't installed — using in-memory limiter")
 else:
     print("Rate limiting: REDIS_URL not set, using in-memory limiter (per-process only)")
 
@@ -233,6 +252,45 @@ def log_audit(conn, admin_id, action, target=None, details=None):
         print("AUDIT LOG ERROR:", e)
 
 # =========================
+# ADMIN PURCHASE REQUESTS (GCash + manual approval)
+# =========================
+# week/month plans expire; lifetime never does (None = no expiry).
+PLAN_DURATIONS = {"week": 7, "month": 30, "lifetime": None}
+
+ALLOWED_SCREENSHOT_MIME = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024  # 3 MB decoded
+
+
+def valid_username(username) -> bool:
+    if not isinstance(username, str):
+        return False
+    if not (3 <= len(username) <= 32):
+        return False
+    return all(c.isalnum() or c == "_" for c in username)
+
+
+def valid_plan(plan) -> bool:
+    return plan in PLAN_DURATIONS
+
+
+def valid_gcash_reference(ref) -> bool:
+    if not isinstance(ref, str):
+        return False
+    return 4 <= len(ref) <= 64
+
+
+def generate_reference_code(conn) -> str:
+    """REQ-XXXXX, retried on the rare chance of a collision."""
+    c = conn.cursor()
+    for _ in range(10):
+        code = "REQ-" + secrets.token_hex(3).upper()  # e.g. REQ-9F3A1C
+        c.execute("SELECT 1 FROM admin_requests WHERE reference_code=%s", (code,))
+        if not c.fetchone():
+            return code
+    raise RuntimeError("could not generate a unique reference code")
+
+
+# =========================
 # JWT MIDDLEWARE
 # =========================
 def token_required(f):
@@ -254,12 +312,15 @@ def token_required(f):
             # token keeps working with the OLD role for up to 2 more hours.
             conn = db()
             c = conn.cursor(cursor_factory=RealDictCursor)
-            c.execute("SELECT id, username, role FROM admins WHERE id=%s", (admin_id,))
+            c.execute("SELECT id, username, role, expires_at FROM admins WHERE id=%s", (admin_id,))
             admin = c.fetchone()
             conn.close()
 
             if not admin:
                 return jsonify({"error": "admin no longer exists"}), 403
+
+            if admin["expires_at"] and datetime.now(timezone.utc) > admin["expires_at"]:
+                return jsonify({"error": "admin account expired"}), 403
 
             g.user = admin["username"]
             g.role = admin["role"]
@@ -305,6 +366,9 @@ def login():
 
     if not admin or not password_ok:
         return jsonify({"error": "invalid credentials"}), 401
+
+    if admin["expires_at"] and datetime.now(timezone.utc) > admin["expires_at"]:
+        return jsonify({"error": "your admin access has expired"}), 403
 
     payload = {
         "user": username,
@@ -976,6 +1040,293 @@ def create_admin():
     except Exception as e:
         print("CREATE ADMIN ERROR:", e)
         return jsonify({"error": "internal server error"}), 500
+
+# ==========================
+# ADMIN PURCHASE REQUESTS (public submission + status check)
+# ==========================
+@app.route("/admin-requests", methods=["POST"])
+def submit_admin_request():
+    if not rate_limiter():
+        return jsonify({"error": "too many requests!"}), 429
+
+    data = request.get_json(silent=True) or {}
+
+    username = data.get("username")
+    password = data.get("password")
+    plan = data.get("plan")
+    gcash_reference = data.get("gcash_reference")
+    screenshot_b64 = data.get("screenshot_base64")
+    screenshot_mime = data.get("screenshot_mime")
+
+    if not valid_username(username):
+        return json_error("username must be 3-32 characters, letters/numbers/underscore only")
+    if not isinstance(password, str) or len(password) < 8:
+        return json_error("password must be at least 8 characters")
+    if not valid_plan(plan):
+        return json_error("plan must be one of: week, month, lifetime")
+    if not valid_gcash_reference(gcash_reference):
+        return json_error("a valid GCash reference number is required")
+    if screenshot_mime not in ALLOWED_SCREENSHOT_MIME:
+        return json_error("screenshot must be png, jpg, or webp")
+    if not isinstance(screenshot_b64, str) or not screenshot_b64:
+        return json_error("proof-of-payment screenshot is required")
+
+    try:
+        decoded_bytes = base64.b64decode(screenshot_b64, validate=True)
+    except Exception:
+        return json_error("screenshot is not valid base64 image data")
+
+    if len(decoded_bytes) > MAX_SCREENSHOT_BYTES:
+        return json_error("screenshot is too large (max 3MB)")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    # Username must be free both among real admins and other pending requests,
+    # so two people can't simultaneously reserve the same desired username.
+    c.execute("SELECT 1 FROM admins WHERE username=%s", (username,))
+    if c.fetchone():
+        conn.close()
+        return json_error("that username is already taken")
+
+    c.execute("""
+        SELECT 1 FROM admin_requests WHERE username=%s AND status='pending'
+    """, (username,))
+    if c.fetchone():
+        conn.close()
+        return json_error("that username already has a pending request")
+
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    reference_code = generate_reference_code(conn)
+
+    c.execute("""
+        INSERT INTO admin_requests
+            (reference_code, username, password_hash, plan, gcash_reference,
+             screenshot_b64, screenshot_mime, status, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', NOW())
+    """, (reference_code, username, password_hash, plan, gcash_reference,
+          screenshot_b64, screenshot_mime))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "request submitted — save your reference code",
+        "reference_code": reference_code
+    }), 201
+
+
+@app.route("/admin-requests/status", methods=["GET"])
+def check_admin_request_status():
+    if not rate_limiter():
+        return jsonify({"error": "too many requests!"}), 429
+
+    reference_code = request.args.get("reference_code", "")
+    if not reference_code:
+        return json_error("reference_code required")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("""
+        SELECT reference_code, plan, status, rejection_reason, created_at, reviewed_at
+        FROM admin_requests
+        WHERE reference_code=%s
+    """, (reference_code,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"status": "not found"})
+
+    return jsonify({
+        "reference_code": row["reference_code"],
+        "plan": row["plan"],
+        "status": row["status"],
+        "rejection_reason": row["rejection_reason"],
+        "created_at": row["created_at"].isoformat(),
+        "reviewed_at": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
+    })
+
+# ==========================
+# ADMIN PURCHASE REQUESTS (superadmin review queue)
+# ==========================
+@app.route("/admin-requests", methods=["GET"])
+@token_required
+@roles_required("superadmin")
+def list_admin_requests():
+    status_filter = request.args.get("status", "pending")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    # screenshot bytes are deliberately excluded here — fetched on demand via
+    # /admin-requests/<id>/screenshot so this list stays light even with many
+    # pending requests.
+    if status_filter == "all":
+        c.execute("""
+            SELECT id, reference_code, username, plan, gcash_reference, status,
+                   rejection_reason, created_at, reviewed_at
+            FROM admin_requests ORDER BY created_at DESC
+        """)
+    else:
+        c.execute("""
+            SELECT id, reference_code, username, plan, gcash_reference, status,
+                   rejection_reason, created_at, reviewed_at
+            FROM admin_requests WHERE status=%s ORDER BY created_at DESC
+        """, (status_filter,))
+
+    rows = c.fetchall()
+    conn.close()
+
+    return jsonify({
+        "requests": [
+            {
+                "id": r["id"],
+                "reference_code": r["reference_code"],
+                "username": r["username"],
+                "plan": r["plan"],
+                "gcash_reference": r["gcash_reference"],
+                "status": r["status"],
+                "rejection_reason": r["rejection_reason"],
+                "created_at": r["created_at"].isoformat(),
+                "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/admin-requests/<int:request_id>/screenshot", methods=["GET"])
+@token_required
+@roles_required("superadmin")
+def get_admin_request_screenshot(request_id):
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("""
+        SELECT screenshot_b64, screenshot_mime FROM admin_requests WHERE id=%s
+    """, (request_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row or not row["screenshot_b64"]:
+        return json_error("screenshot not found (may have already been reviewed)", 404)
+
+    return jsonify({
+        "screenshot_base64": row["screenshot_b64"],
+        "screenshot_mime": row["screenshot_mime"]
+    })
+
+
+@app.route("/admin-requests/<int:request_id>/approve", methods=["POST"])
+@token_required
+@roles_required("superadmin")
+def approve_admin_request(request_id):
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM admin_requests WHERE id=%s", (request_id,))
+    reqrow = c.fetchone()
+
+    if not reqrow:
+        conn.close()
+        return json_error("request not found", 404)
+
+    if reqrow["status"] != "pending":
+        conn.close()
+        return json_error(f"request already {reqrow['status']}")
+
+    # Race-condition guard: someone could have taken this username between
+    # submission and approval (e.g. a manually-created admin).
+    c.execute("SELECT 1 FROM admins WHERE username=%s", (reqrow["username"],))
+    if c.fetchone():
+        conn.close()
+        return json_error("that username was taken in the meantime — reject this request")
+
+    plan = reqrow["plan"]
+    duration_days = PLAN_DURATIONS.get(plan)
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=duration_days)) if duration_days else None
+
+    c.execute("""
+        INSERT INTO admins (username, password_hash, role, created_at, expires_at, plan)
+        VALUES (%s, %s, 'admin', NOW(), %s, %s)
+    """, (reqrow["username"], reqrow["password_hash"], expires_at, plan))
+
+    # Screenshot has served its purpose — clear it to keep the table lean.
+    c.execute("""
+        UPDATE admin_requests
+        SET status='approved', reviewed_at=NOW(), reviewed_by=%s,
+            screenshot_b64=NULL
+        WHERE id=%s
+    """, (g.admin_id, request_id))
+
+    log_audit(conn, g.admin_id, "approve_admin_request", reqrow["username"], f"plan={plan}")
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "admin account created",
+        "username": reqrow["username"],
+        "expires_at": expires_at.isoformat() if expires_at else None
+    })
+
+
+@app.route("/admin-requests/<int:request_id>/reject", methods=["POST"])
+@token_required
+@roles_required("superadmin")
+def reject_admin_request(request_id):
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT status, username FROM admin_requests WHERE id=%s", (request_id,))
+    reqrow = c.fetchone()
+
+    if not reqrow:
+        conn.close()
+        return json_error("request not found", 404)
+
+    if reqrow["status"] != "pending":
+        conn.close()
+        return json_error(f"request already {reqrow['status']}")
+
+    c.execute("""
+        UPDATE admin_requests
+        SET status='rejected', reviewed_at=NOW(), reviewed_by=%s,
+            rejection_reason=%s, screenshot_b64=NULL
+        WHERE id=%s
+    """, (g.admin_id, reason or None, request_id))
+
+    log_audit(conn, g.admin_id, "reject_admin_request", reqrow["username"], reason or "")
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "request rejected"})
 
 # =========================
 # keep database alive
