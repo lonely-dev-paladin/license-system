@@ -5,12 +5,14 @@ from flask import Flask, request, jsonify, g
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 import time
 import jwt
 import bcrypt
+import redis
 from psycopg2 import OperationalError
 
 SECRET_KEY = os.getenv("JWT_SECRET")
@@ -18,6 +20,20 @@ if not SECRET_KEY:
     raise RuntimeError("JWT SECRET is missing")
 
 app = Flask(__name__)
+
+# Render (and most PaaS platforms) sit exactly one reverse proxy in front of
+# this app. ProxyFix rewrites request.remote_addr using ONLY the trusted
+# rightmost hop of X-Forwarded-For — a client can prepend fake IPs to that
+# header (e.g. "1.2.3.4, <real client ip>") and Werkzeug will correctly
+# ignore the spoofed part. Without this, get_client_ip() below was reading
+# the client-controlled first value, letting anyone bypass IP rate limiting
+# by just sending a different fake IP on every request.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
+# Defense-in-depth against oversized request bodies (memory-exhaustion DoS).
+# Nothing this API does legitimately needs more than a few KB per request.
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024  # 16 KB
+
 CORS(app, origins=["https://licenseui.onrender.com"])  # talks to frontend
 
 # =========================
@@ -47,13 +63,36 @@ def db():
 # =========================
 # RATE LIMIT
 # =========================
-RATE_LIMIT = {}
+# Backed by Redis when available, so the limit is shared correctly across
+# multiple worker processes/dynos instead of each one keeping its own count.
+# Falls back to the original in-memory limiter automatically if Redis is
+# unset or unreachable — degrades to per-process accuracy rather than
+# breaking login/validate entirely during a Redis outage.
+REDIS_URL = os.getenv("REDIS_URL")
+_redis_client = None
+
+if REDIS_URL:
+    try:
+        _redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        _redis_client.ping()
+        print("Rate limiting: connected to Redis")
+    except Exception as e:
+        print("Rate limiting: Redis unreachable at startup, using in-memory fallback:", e)
+        _redis_client = None
+else:
+    print("Rate limiting: REDIS_URL not set, using in-memory limiter (per-process only)")
+
 RATE_WINDOW = 60
 RATE_MAX_IP = 30
 RATE_MAX_USER = 5
 
-# only sweep occasionally instead of every request, so we don't
-# pay the cleanup cost on every single call
+# --- in-memory fallback store ---
+RATE_LIMIT = {}
 _LAST_SWEEP = 0
 SWEEP_INTERVAL = 300  # 5 minutes
 
@@ -74,32 +113,66 @@ def _sweep_rate_limit(now):
         RATE_LIMIT.pop(key, None)
 
 
+def _check_limit_memory(key, limit, now):
+    _sweep_rate_limit(now)
+    history = list(RATE_LIMIT.get(key) or [])
+    history = [t for t in history if now - t < RATE_WINDOW]
+    if len(history) >= limit:
+        RATE_LIMIT[key] = history
+        return False
+    history.append(now)
+    RATE_LIMIT[key] = history
+    return True
+
+
+def _check_limit_redis(key, limit, now):
+    """Sliding-window limit using a Redis sorted set: score = request time,
+    member = unique per-request string. Same semantics as the in-memory
+    version, just shared across all processes."""
+    try:
+        redis_key = f"ratelimit:{key}"
+
+        pipe = _redis_client.pipeline()
+        pipe.zremrangebyscore(redis_key, 0, now - RATE_WINDOW)
+        pipe.zcard(redis_key)
+        _, count = pipe.execute()
+
+        if count >= limit:
+            return False
+
+        member = f"{now}:{os.urandom(4).hex()}"  # random suffix avoids same-timestamp collisions
+        pipe = _redis_client.pipeline()
+        pipe.zadd(redis_key, {member: now})
+        pipe.expire(redis_key, RATE_WINDOW + 5)
+        pipe.execute()
+        return True
+
+    except Exception as e:
+        # Transient Redis hiccup mid-request — don't lock everyone out,
+        # fall back to this process's own in-memory count for this check.
+        print("Rate limiting: Redis error, falling back to in-memory for this check:", e)
+        return _check_limit_memory(key, limit, now)
+
+
+def check_limit(key, limit):
+    now = time.time()
+    if _redis_client is not None:
+        return _check_limit_redis(key, limit, now)
+    return _check_limit_memory(key, limit, now)
+
+
 def get_client_ip():
-    ip = request.headers.get("X-Forwarded-For")
-    if ip:
-        ip = ip.split(",")[0].strip()
-    else:
-        ip = request.remote_addr
-    return ip or "unknown"
+    # ProxyFix (registered above) already rewrote remote_addr using the
+    # trusted proxy hop of X-Forwarded-For — reading the header directly
+    # here would reopen the spoofing hole ProxyFix exists to close.
+    return request.remote_addr or "unknown"
 
 
 def rate_limiter(username=None):
     ip = get_client_ip()
-    now = time.time()
-    _sweep_rate_limit(now)
 
     ip_key = f"ip:{ip}"
     user_key = f"user:{username}" if username else None
-
-    def check_limit(key, limit):
-        history = list(RATE_LIMIT.get(key) or [])
-        history = [t for t in history if now - t < RATE_WINDOW]
-        if len(history) >= limit:
-            RATE_LIMIT[key] = history
-            return False
-        history.append(now)
-        RATE_LIMIT[key] = history
-        return True
 
     if not check_limit(ip_key, RATE_MAX_IP):
         return False
@@ -128,9 +201,21 @@ MAX_DEVICES_CAP = 1000   # sanity cap on devices-per-key
 def valid_license_key(key: str) -> bool:
     if not isinstance(key, str):
         return False
-    if not (4 <= len(key) <= 128):
+    if not (10 <= len(key) <= 128):
         return False
     return all(c.isalnum() or c in "-_" for c in key)
+
+
+def valid_device_id(device_id) -> bool:
+    # device_id comes from client apps we don't fully control (Android
+    # ANDROID_ID, custom hardware fingerprints, etc.), so this is deliberately
+    # more permissive than valid_license_key — just enough to stop absurdly
+    # long payloads or non-string junk from reaching the database.
+    if not isinstance(device_id, str):
+        return False
+    if not (1 <= len(device_id) <= 256):
+        return False
+    return all(c.isalnum() or c in "-_:." for c in device_id)
 
 
 def log_audit(conn, admin_id, action, target=None, details=None):
@@ -163,17 +248,21 @@ def token_required(f):
             decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             admin_id = decoded["admin_id"]
 
+            # Re-fetch role/username from the DB rather than trusting what
+            # was embedded in the token at login time. Otherwise, if a
+            # superadmin changes another admin's role mid-session, the old
+            # token keeps working with the OLD role for up to 2 more hours.
             conn = db()
-            c = conn.cursor()
-            c.execute("SELECT id FROM admins WHERE id=%s", (admin_id,))
+            c = conn.cursor(cursor_factory=RealDictCursor)
+            c.execute("SELECT id, username, role FROM admins WHERE id=%s", (admin_id,))
             admin = c.fetchone()
             conn.close()
 
             if not admin:
                 return jsonify({"error": "admin no longer exists"}), 403
 
-            g.user = decoded["user"]
-            g.role = decoded["role"]
+            g.user = admin["username"]
+            g.role = admin["role"]
             g.admin_id = admin_id
 
         except jwt.ExpiredSignatureError:
@@ -238,7 +327,7 @@ def add_license():
 
     license_key = data.get("license_key")
     if not license_key or not valid_license_key(license_key):
-        return json_error("license key required (4-128 alphanumeric/-/_ chars)")
+        return json_error("license key required (10-128 alphanumeric/-/_ chars)")
 
     try:
         days = int(data.get("days", 7))
@@ -302,6 +391,12 @@ def validate():
 
     if not license_key or not device_id:
         return json_error("license and device id required")
+
+    if not isinstance(license_key, str) or len(license_key) > 128:
+        return json_error("invalid license key")
+
+    if not valid_device_id(device_id):
+        return json_error("invalid device id")
 
     try:
         conn = db()
@@ -405,6 +500,9 @@ def reset_device():
 
     if not key:
         return json_error("license key required")
+
+    if device_id is not None and not valid_device_id(device_id):
+        return json_error("invalid device id")
 
     try:
         conn = db()
@@ -891,7 +989,10 @@ def ping():
         conn.close()
         return jsonify({"status": "awake"}), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # /ping is public and unauthenticated — never echo exception details
+        # (connection strings, internal paths, etc.) back to the caller.
+        print("PING ERROR:", e)
+        return jsonify({"status": "error"}), 500
 
 # =========================
 # RUN
