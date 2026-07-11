@@ -1066,18 +1066,26 @@ def submit_admin_request():
         return json_error("plan must be one of: week, month, lifetime")
     if not valid_gcash_reference(gcash_reference):
         return json_error("a valid GCash reference number is required")
-    if screenshot_mime not in ALLOWED_SCREENSHOT_MIME:
-        return json_error("screenshot must be png, jpg, or webp")
-    if not isinstance(screenshot_b64, str) or not screenshot_b64:
-        return json_error("proof-of-payment screenshot is required")
 
-    try:
-        decoded_bytes = base64.b64decode(screenshot_b64, validate=True)
-    except Exception:
-        return json_error("screenshot is not valid base64 image data")
+    # Screenshot is optional — some buyers can't get the file picker to work
+    # in certain WebView-based browsers. If they do attach one, it's still
+    # validated normally; if not, we just store NULL for both fields.
+    has_screenshot = isinstance(screenshot_b64, str) and screenshot_b64.strip() != ""
 
-    if len(decoded_bytes) > MAX_SCREENSHOT_BYTES:
-        return json_error("screenshot is too large (max 3MB)")
+    if has_screenshot:
+        if screenshot_mime not in ALLOWED_SCREENSHOT_MIME:
+            return json_error("screenshot must be png, jpg, or webp")
+
+        try:
+            decoded_bytes = base64.b64decode(screenshot_b64, validate=True)
+        except Exception:
+            return json_error("screenshot is not valid base64 image data")
+
+        if len(decoded_bytes) > MAX_SCREENSHOT_BYTES:
+            return json_error("screenshot is too large (max 3MB)")
+    else:
+        screenshot_b64 = None
+        screenshot_mime = None
 
     try:
         conn = db()
@@ -1173,17 +1181,20 @@ def list_admin_requests():
 
     # screenshot bytes are deliberately excluded here — fetched on demand via
     # /admin-requests/<id>/screenshot so this list stays light even with many
-    # pending requests.
+    # pending requests. has_screenshot just tells the UI whether there's
+    # anything to view, since the screenshot itself is now optional.
     if status_filter == "all":
         c.execute("""
             SELECT id, reference_code, username, plan, gcash_reference, status,
-                   rejection_reason, created_at, reviewed_at
+                   rejection_reason, created_at, reviewed_at,
+                   (screenshot_b64 IS NOT NULL) AS has_screenshot
             FROM admin_requests ORDER BY created_at DESC
         """)
     else:
         c.execute("""
             SELECT id, reference_code, username, plan, gcash_reference, status,
-                   rejection_reason, created_at, reviewed_at
+                   rejection_reason, created_at, reviewed_at,
+                   (screenshot_b64 IS NOT NULL) AS has_screenshot
             FROM admin_requests WHERE status=%s ORDER BY created_at DESC
         """, (status_filter,))
 
@@ -1202,6 +1213,7 @@ def list_admin_requests():
                 "rejection_reason": r["rejection_reason"],
                 "created_at": r["created_at"].isoformat(),
                 "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
+                "has_screenshot": r["has_screenshot"],
             }
             for r in rows
         ]
