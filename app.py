@@ -317,7 +317,13 @@ def token_required(f):
             conn.close()
 
             if not admin:
-                return jsonify({"error": "admin no longer exists"}), 403
+                # The only way this account row disappears is via the
+                # terminate-admin action (there's no other delete path), so
+                # this is safe to always attribute to termination.
+                return jsonify({
+                    "error": "You have been terminated by the owner.",
+                    "terminated": True
+                }), 403
 
             if admin["expires_at"] and datetime.now(timezone.utc) > admin["expires_at"]:
                 return jsonify({"error": "admin account expired"}), 403
@@ -357,14 +363,34 @@ def login():
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT * FROM admins WHERE username=%s", (username,))
     admin = c.fetchone()
-    conn.close()
 
     # Always check a password hash, even for unknown usernames, so
     # response time doesn't leak whether the username exists.
     hash_to_check = admin["password_hash"] if admin else _DUMMY_HASH
     password_ok = bcrypt.checkpw(password.encode(), hash_to_check.encode())
 
-    if not admin or not password_ok:
+    if not admin:
+        # This username was likely terminated by a superadmin — the
+        # terminate_admin audit entry survives the account wipe since it's
+        # logged under the ACTING superadmin's own admin_id, not the
+        # terminated admin's. Tell them clearly instead of a generic error.
+        c.execute("""
+            SELECT 1 FROM audit_log WHERE action='terminate_admin' AND target=%s LIMIT 1
+        """, (username,))
+        was_terminated = c.fetchone() is not None
+        conn.close()
+
+        if was_terminated:
+            return jsonify({
+                "error": "You have been terminated by the owner.",
+                "terminated": True
+            }), 403
+
+        return jsonify({"error": "invalid credentials"}), 401
+
+    conn.close()
+
+    if not password_ok:
         return jsonify({"error": "invalid credentials"}), 401
 
     if admin["expires_at"] and datetime.now(timezone.utc) > admin["expires_at"]:
@@ -1339,6 +1365,118 @@ def reject_admin_request(request_id):
     conn.close()
 
     return jsonify({"message": "request rejected"})
+
+# ==========================
+# ADMIN MANAGEMENT (superadmin only) — view + permanently terminate accounts
+# ==========================
+@app.route("/admins", methods=["GET"])
+@token_required
+@roles_required("superadmin")
+def list_admins():
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    # key_count/log_count are shown up front in the dashboard so a superadmin
+    # sees the full blast radius (how much data would be wiped) before ever
+    # opening the termination confirmation — no separate "preview" call needed.
+    c.execute("""
+        SELECT a.id, a.username, a.role, a.plan, a.expires_at, a.created_at,
+               COALESCE(u.key_count, 0) AS key_count,
+               COALESCE(al.log_count, 0) AS log_count
+        FROM admins a
+        LEFT JOIN (
+            SELECT admin_id, COUNT(*) AS key_count FROM users GROUP BY admin_id
+        ) u ON u.admin_id = a.id
+        LEFT JOIN (
+            SELECT admin_id, COUNT(*) AS log_count FROM audit_log GROUP BY admin_id
+        ) al ON al.admin_id = a.id
+        ORDER BY a.created_at DESC NULLS LAST
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    return jsonify({
+        "admins": [
+            {
+                "id": str(r["id"]),
+                "username": r["username"],
+                "role": r["role"],
+                "plan": r["plan"],
+                "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "key_count": r["key_count"],
+                "log_count": r["log_count"],
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/admins/<admin_id>", methods=["DELETE"])
+@token_required
+@roles_required("superadmin")
+def terminate_admin(admin_id):
+    """Permanently deletes an admin/moderator account and ALL of their data:
+    their license keys (which cascades to bound devices via an existing FK),
+    and their own audit log history (which cascades via an existing FK on
+    admins.id). This is intentionally a full wipe, not a soft-delete —
+    there is no undo."""
+
+    if admin_id == str(g.admin_id):
+        return json_error("you cannot terminate your own account")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT id, username, role FROM admins WHERE id=%s", (admin_id,))
+    target = c.fetchone()
+
+    if not target:
+        conn.close()
+        return json_error("admin not found", 404)
+
+    # Superadmin accounts are protected from this action entirely — removing
+    # one requires direct database access, not a button in the UI.
+    if target["role"] == "superadmin":
+        conn.close()
+        return json_error("superadmin accounts cannot be terminated this way")
+
+    # Captured before deletion, purely for the audit trail this action leaves
+    # behind under the ACTING superadmin's own admin_id (not the deleted
+    # admin's — that row is about to be gone).
+    c.execute("SELECT COUNT(*) AS c FROM users WHERE admin_id=%s", (admin_id,))
+    key_count = c.fetchone()["c"]
+    c.execute("SELECT COUNT(*) AS c FROM audit_log WHERE admin_id=%s", (admin_id,))
+    log_count = c.fetchone()["c"]
+
+    # Delete their license keys first — license_devices cascades automatically
+    # via its existing FK to users.license_key.
+    c.execute("DELETE FROM users WHERE admin_id=%s", (admin_id,))
+
+    # Deleting the admin row cascades their own audit_log entries (existing
+    # FK), and any admin_requests.reviewed_by pointing at them gets set NULL
+    # automatically rather than blocking the delete.
+    c.execute("DELETE FROM admins WHERE id=%s", (admin_id,))
+
+    log_audit(conn, g.admin_id, "terminate_admin", target["username"],
+               f"role={target['role']}, keys_deleted={key_count}, log_entries_deleted={log_count}")
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "admin terminated",
+        "username": target["username"],
+        "keys_deleted": key_count,
+        "log_entries_deleted": log_count
+    })
 
 # =========================
 # keep database alive
