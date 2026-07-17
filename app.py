@@ -279,15 +279,23 @@ def valid_gcash_reference(ref) -> bool:
     return 4 <= len(ref) <= 64
 
 
-def generate_reference_code(conn) -> str:
-    """REQ-XXXXX, retried on the rare chance of a collision."""
+def generate_reference_code(conn, table="admin_requests", prefix="REQ") -> str:
+    """<PREFIX>-XXXXX, retried on the rare chance of a collision. Shared by
+    admin purchase requests (REQ-) and password reset requests (PWR-)."""
     c = conn.cursor()
     for _ in range(10):
-        code = "REQ-" + secrets.token_hex(3).upper()  # e.g. REQ-9F3A1C
-        c.execute("SELECT 1 FROM admin_requests WHERE reference_code=%s", (code,))
+        code = f"{prefix}-" + secrets.token_hex(3).upper()  # e.g. REQ-9F3A1C
+        c.execute(f"SELECT 1 FROM {table} WHERE reference_code=%s", (code,))
         if not c.fetchone():
             return code
     raise RuntimeError("could not generate a unique reference code")
+
+
+def generate_temp_password() -> str:
+    """12-character password from an unambiguous alphabet (no 0/O/1/l/I),
+    for handing to an admin whose password was just reset."""
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(12))
 
 
 # =========================
@@ -1477,6 +1485,229 @@ def terminate_admin(admin_id):
         "keys_deleted": key_count,
         "log_entries_deleted": log_count
     })
+
+# ==========================
+# PASSWORD RESET (public submission + status check)
+# ==========================
+@app.route("/password-reset-requests", methods=["POST"])
+def submit_password_reset_request():
+    if not rate_limiter():
+        return jsonify({"error": "too many requests!"}), 429
+
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+
+    if not valid_username(username):
+        return json_error("enter a valid username")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT 1 FROM admins WHERE username=%s", (username,))
+    if not c.fetchone():
+        conn.close()
+        return json_error("no admin account found with that username")
+
+    c.execute("""
+        SELECT 1 FROM password_reset_requests WHERE username=%s AND status='pending'
+    """, (username,))
+    if c.fetchone():
+        conn.close()
+        return json_error("a reset request for this username is already pending")
+
+    reference_code = generate_reference_code(conn, table="password_reset_requests", prefix="PWR")
+
+    c.execute("""
+        INSERT INTO password_reset_requests (reference_code, username, status, created_at)
+        VALUES (%s, %s, 'pending', NOW())
+    """, (reference_code, username))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "reset request submitted — save your reference code",
+        "reference_code": reference_code
+    }), 201
+
+
+@app.route("/password-reset-requests/status", methods=["GET"])
+def check_password_reset_status():
+    if not rate_limiter():
+        return jsonify({"error": "too many requests!"}), 429
+
+    reference_code = request.args.get("reference_code", "")
+    if not reference_code:
+        return json_error("reference_code required")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("""
+        SELECT reference_code, status, rejection_reason, created_at, reviewed_at
+        FROM password_reset_requests
+        WHERE reference_code=%s
+    """, (reference_code,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"status": "not found"})
+
+    # Deliberately never returns the new password itself, even once approved
+    # — that's handed to the superadmin only, to relay out-of-band (same
+    # trust model as confirming a GCash payment before approving a purchase).
+    return jsonify({
+        "reference_code": row["reference_code"],
+        "status": row["status"],
+        "rejection_reason": row["rejection_reason"],
+        "created_at": row["created_at"].isoformat(),
+        "reviewed_at": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
+    })
+
+# ==========================
+# PASSWORD RESET (superadmin review queue)
+# ==========================
+@app.route("/password-reset-requests", methods=["GET"])
+@token_required
+@roles_required("superadmin")
+def list_password_reset_requests():
+    status_filter = request.args.get("status", "pending")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    if status_filter == "all":
+        c.execute("""
+            SELECT id, reference_code, username, status, rejection_reason,
+                   created_at, reviewed_at
+            FROM password_reset_requests ORDER BY created_at DESC
+        """)
+    else:
+        c.execute("""
+            SELECT id, reference_code, username, status, rejection_reason,
+                   created_at, reviewed_at
+            FROM password_reset_requests WHERE status=%s ORDER BY created_at DESC
+        """, (status_filter,))
+
+    rows = c.fetchall()
+    conn.close()
+
+    return jsonify({
+        "requests": [
+            {
+                "id": r["id"],
+                "reference_code": r["reference_code"],
+                "username": r["username"],
+                "status": r["status"],
+                "rejection_reason": r["rejection_reason"],
+                "created_at": r["created_at"].isoformat(),
+                "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
+            }
+            for r in rows
+        ]
+    })
+
+
+@app.route("/password-reset-requests/<int:request_id>/approve", methods=["POST"])
+@token_required
+@roles_required("superadmin")
+def approve_password_reset_request(request_id):
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM password_reset_requests WHERE id=%s", (request_id,))
+    reqrow = c.fetchone()
+
+    if not reqrow:
+        conn.close()
+        return json_error("request not found", 404)
+
+    if reqrow["status"] != "pending":
+        conn.close()
+        return json_error(f"request already {reqrow['status']}")
+
+    c.execute("SELECT id FROM admins WHERE username=%s", (reqrow["username"],))
+    target_admin = c.fetchone()
+
+    if not target_admin:
+        conn.close()
+        return json_error("that admin account no longer exists — reject this request")
+
+    new_password = generate_temp_password()
+    new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+
+    c.execute("UPDATE admins SET password_hash=%s WHERE id=%s", (new_hash, target_admin["id"]))
+
+    c.execute("""
+        UPDATE password_reset_requests
+        SET status='approved', reviewed_at=NOW(), reviewed_by=%s
+        WHERE id=%s
+    """, (g.admin_id, request_id))
+
+    # The new password itself is deliberately NOT written to the audit log —
+    # only that a reset happened, and for whom.
+    log_audit(conn, g.admin_id, "approve_password_reset", reqrow["username"])
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "password reset — relay this to the admin, it will not be shown again",
+        "username": reqrow["username"],
+        "new_password": new_password
+    })
+
+
+@app.route("/password-reset-requests/<int:request_id>/reject", methods=["POST"])
+@token_required
+@roles_required("superadmin")
+def reject_password_reset_request(request_id):
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT status, username FROM password_reset_requests WHERE id=%s", (request_id,))
+    reqrow = c.fetchone()
+
+    if not reqrow:
+        conn.close()
+        return json_error("request not found", 404)
+
+    if reqrow["status"] != "pending":
+        conn.close()
+        return json_error(f"request already {reqrow['status']}")
+
+    c.execute("""
+        UPDATE password_reset_requests
+        SET status='rejected', reviewed_at=NOW(), reviewed_by=%s, rejection_reason=%s
+        WHERE id=%s
+    """, (g.admin_id, reason or None, request_id))
+
+    log_audit(conn, g.admin_id, "reject_password_reset", reqrow["username"], reason or "")
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "request rejected"})
 
 # =========================
 # keep database alive
