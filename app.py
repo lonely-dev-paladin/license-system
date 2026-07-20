@@ -220,7 +220,12 @@ MAX_DEVICES_CAP = 1000   # sanity cap on devices-per-key
 def valid_license_key(key: str) -> bool:
     if not isinstance(key, str):
         return False
-    if not (10 <= len(key) <= 128):
+    # Lowered from 10 to 7 to accommodate the shortest generated key-type
+    # formats from the panel's Generate Key dropdown (e.g. "BS-9090" and
+    # "CF-9879", both exactly 7 characters: a short prefix, a dash, and a
+    # 4-digit numeric suffix). Longer formats (CODM-/MLBB-/Default) and any
+    # manually-entered key are unaffected — this only widens what's allowed.
+    if not (7 <= len(key) <= 128):
         return False
     return all(c.isalnum() or c in "-_" for c in key)
 
@@ -425,7 +430,7 @@ def add_license():
 
     license_key = data.get("license_key")
     if not license_key or not valid_license_key(license_key):
-        return json_error("license key required (10-128 alphanumeric/-/_ chars)")
+        return json_error("license key required (7-128 alphanumeric/-/_ chars)")
 
     try:
         days = int(data.get("days", 7))
