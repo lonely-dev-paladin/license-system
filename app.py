@@ -463,8 +463,8 @@ def add_license():
     # NOTE: expires and activated_at stay NULL here on purpose — the key's
     # countdown doesn't start until the first device binds to it via /validate.
     c.execute("""
-        INSERT INTO users (license_key, status, banned, admin_id, max_devices, duration_days)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO users (license_key, status, banned, admin_id, max_devices, duration_days, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW())
     """, (license_key, "premium", False, g.admin_id, max_devices, days))
 
     log_audit(conn, g.admin_id, "create_license", license_key,
@@ -508,7 +508,7 @@ def validate():
 
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("""
-        SELECT license_key, status, expires, banned, max_devices, duration_days, activated_at
+        SELECT license_key, status, expires, banned, max_devices, duration_days, activated_at, admin_id
         FROM users
         WHERE license_key=%s
     """, (license_key,))
@@ -521,6 +521,17 @@ def validate():
     if user["banned"]:
         conn.close()
         return jsonify({"status": "banned"})
+
+    # Global per-admin HWID blocklist: this device is rejected on ANY key
+    # owned by this admin, not just the one it was originally blocked from —
+    # checked on every validate call (not just first bind) so a device
+    # blocked mid-session gets kicked out on its next check-in too.
+    c.execute("""
+        SELECT 1 FROM blocked_devices WHERE admin_id=%s AND device_id=%s
+    """, (user["admin_id"], device_id))
+    if c.fetchone():
+        conn.close()
+        return jsonify({"status": "device blocked"})
 
     now = datetime.now(timezone.utc)
 
@@ -642,6 +653,124 @@ def reset_device():
     conn.close()
 
     return jsonify({"message": "device reset successfully", "removed": removed})
+
+# =========================
+# BLOCK / UNBLOCK DEVICE (global per-admin HWID blocklist)
+# =========================
+@app.route("/block-device", methods=["POST"])
+@token_required
+@roles_required("admin", "moderator", "superadmin")
+def block_device():
+    """Blocks a device ID globally across every license key this admin owns
+    (checked in /validate) and immediately unbinds it from the license it
+    was blocked from, if currently bound. Unlike ban/reset-device, this
+    stops the specific hardware from reconnecting even with a different key
+    or after a future device reset."""
+    data = request.get_json(silent=True) or {}
+    key = data.get("license_key")
+    device_id = data.get("device_id")
+    reason = data.get("reason")
+
+    if not key:
+        return json_error("license key required")
+
+    if not device_id or not valid_device_id(device_id):
+        return json_error("valid device id required")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+
+    # ownership check — this key must belong to the calling admin
+    c.execute("SELECT 1 FROM users WHERE license_key=%s AND admin_id=%s", (key, g.admin_id))
+    if not c.fetchone():
+        conn.close()
+        return json_error("not found")
+
+    # Kick the device off its current binding immediately, if bound.
+    c.execute("DELETE FROM license_devices WHERE license_key=%s AND device_id=%s", (key, device_id))
+
+    # Idempotent — repeat-blocking an already-blocked device keeps the
+    # original reason/blocked_at instead of overwriting it.
+    c.execute("""
+        INSERT INTO blocked_devices (admin_id, device_id, reason)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (admin_id, device_id) DO NOTHING
+    """, (g.admin_id, device_id, reason or None))
+
+    log_audit(conn, g.admin_id, "block_device", device_id,
+               f"license_key={key}" + (f", reason={reason}" if reason else ""))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "device blocked", "device_id": device_id})
+
+
+@app.route("/unblock-device", methods=["POST"])
+@token_required
+@roles_required("admin", "moderator", "superadmin")
+def unblock_device():
+    data = request.get_json(silent=True) or {}
+    device_id = data.get("device_id")
+
+    if not device_id:
+        return json_error("device id required")
+
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor()
+    c.execute("DELETE FROM blocked_devices WHERE admin_id=%s AND device_id=%s", (g.admin_id, device_id))
+    removed = c.rowcount
+
+    if removed == 0:
+        conn.close()
+        return json_error("device not found in blocklist", 404)
+
+    log_audit(conn, g.admin_id, "unblock_device", device_id)
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"message": "device unblocked", "device_id": device_id})
+
+
+@app.route("/blocked-devices", methods=["GET"])
+@token_required
+@roles_required("admin", "moderator", "superadmin")
+def blocked_devices():
+    try:
+        conn = db()
+    except OperationalError:
+        return jsonify({"error": "database connection failed"}), 500
+
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("""
+        SELECT id, device_id, reason, blocked_at
+        FROM blocked_devices
+        WHERE admin_id=%s
+        ORDER BY blocked_at DESC
+    """, (g.admin_id,))
+    rows = c.fetchall()
+    conn.close()
+
+    return jsonify({
+        "devices": [
+            {
+                "id": r["id"],
+                "device_id": r["device_id"],
+                "reason": r["reason"],
+                "blocked_at": r["blocked_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    })
 
 # =========================
 # BAN
@@ -902,7 +1031,7 @@ def users():
     # expires date, so we compute active/expired/pending/banned fresh each time.
     c.execute("""
         SELECT u.license_key, u.status, u.banned, u.expires, u.max_devices,
-               u.duration_days, u.activated_at,
+               u.duration_days, u.activated_at, u.created_at,
                COALESCE(d.device_count, 0) AS device_count,
                COALESCE(d.device_list, ARRAY[]::text[]) AS device_list
         FROM users u
@@ -955,6 +1084,7 @@ def users():
             "state": state,
             "time_left": time_left,
             "expires": u["expires"].isoformat() if u["expires"] else None,
+            "created_at": u["created_at"].isoformat() if u["created_at"] else None,
             "max_devices": u["max_devices"],
             "device_count": u["device_count"],
             "devices": u["device_list"],
